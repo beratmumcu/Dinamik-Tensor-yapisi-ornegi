@@ -1,0 +1,1 @@
+# Dinamik-Tensor-yapisi-ornegi
