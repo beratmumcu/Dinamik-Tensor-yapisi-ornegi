@@ -1,0 +1,254 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <math.h>   // Matematiksel exp() fonksiyonu (Sigmoid için)
+
+// --- AŞAMA 1: VERİ TİPİ TANIMLARI ---
+
+typedef enum {
+    DTYPE_FLOAT32,  // Standart ondalıklı sayı (4 Byte)
+    DTYPE_FLOAT16,  // Yarı hassasiyet (2 Byte - Simülasyon)
+    DTYPE_INT8      // Sıkıştırılmış Tamsayı (1 Byte) - EN ÖNEMLİSİ
+} DataType;
+// ==========================================
+// Quantization Parametreleri:
+// Sıkıştırılmış (INT8) veriyi tekrar Gerçek (Float) değere çevirmek için gereken formül.
+// Formül: Gerçek_Değer = (Kayıtlı_INT8 - Zero_Point) * Scale
+// ==========================================
+typedef struct {
+    float scale;   // Ölçek çarpanı (Örn: 0.05)
+    int32_t zero_point;   // Sıfır noktası kaydırması
+} QuantParams;
+// ==========================================
+// TENSÖR YAPISI (THE CONTAINER)
+// Bu yapı, bellekteki veriyi yöneten ana kutudur.
+// ==========================================
+typedef struct {
+    void* data;    // <--- JOKER İŞARETÇİ: Verinin türünü bilmez, sadece başlangıç adresini tutar.
+    uint32_t* shape;   // Boyut bilgisi dizisi (Örn: [1, 2] -> 1 satır 2 sütun)
+    uint8_t dims;      // Kaç boyutlu olduğu (Rank)
+    uint32_t total_size;  // Toplam eleman sayısı (Çarpım sonucu)
+    DataType dtype;      // Kutunun içindeki verinin tür etiketi
+    QuantParams qparams;  // Dönüşüm anahtarları
+} Tensor;
+// ==========================================
+// --- AŞAMA 2 & 3: BELLEK YÖNETİMİ ---
+// Amacı: RAM'den yer almak (malloc) ve iade etmek (free).
+// ==========================================
+Tensor* create_tensor(uint32_t* shape, uint8_t dims, DataType dtype, QuantParams qparams) {
+    // DÜZELTME: Tüm değişkenler en başta tanımlanmalı (ANSI C kuralı)
+    Tensor* t;
+    int i; 
+    size_t element_size;   // Bir elemanın kaç bayt tutacağı
+    
+    // 1. Tensörün "meta verisi" (kabuğu) için yer ayır
+    t = (Tensor*)malloc(sizeof(Tensor));
+    
+    if (t == NULL) return NULL; // Güvenlik kontrolü // RAM dolduysa çökme, NULL dön.
+
+    t->dims = dims;
+    t->dtype = dtype;
+    t->qparams = qparams;
+    
+    // 2. Şekil dizisi için yer ayır ve kopyala.
+    t->shape = (uint32_t*)malloc(dims * sizeof(uint32_t));
+    t->total_size = 1;
+
+    // DÜZELTME: Döngü değişkeni 'i' yukarıda tanımlandı
+    for (i = 0; i < dims; i++) {
+        t->shape[i] = shape[i];
+        t->total_size *= shape[i];   // Toplam eleman sayısını hesapla
+    }
+    
+    // 3. Veri tipine göre bellek boyutunu belirle.
+    element_size = 0;
+    switch (dtype) {
+        case DTYPE_FLOAT32: element_size = sizeof(float); break;
+        case DTYPE_FLOAT16: element_size = sizeof(uint16_t); break;
+        case DTYPE_INT8:    element_size = sizeof(int8_t); break;
+    }
+    
+    // 4. Asıl veri için RAM'den blok iste.
+    t->data = malloc(t->total_size * element_size);
+    
+    // Güvenlik: RAM yetmediyse oluşturulan her şeyi temizle ve iptal et.
+    if (t->data == NULL) {
+        printf("Hata: Bellek yetersiz!\n");
+        free(t->shape); // Sızıntıyı önle
+        free(t);
+        return NULL;
+    }
+
+    return t;
+}
+// Çöp Toplayıcı (Garbage Collector olmadığı için manuel yapıyoruz)
+void free_tensor(Tensor* t) {
+    if (t) {
+        if (t->shape) free(t->shape);  // Önce içindekileri boşalt
+        if (t->data) free(t->data);
+        free(t);    // Sonra kutunun kendisini at
+    }
+}
+// ==========================================
+// --- AŞAMA 4: ERİŞİM (GET/SET) ---
+// Amacı: Veri int8 de olsa float da olsa, kullanıcıya hep float vermek.
+// ==========================================
+float tensor_get_as_float(Tensor* t, uint32_t index) {
+    // Değişken tanımları
+    int8_t val_i8;
+    uint16_t val_u16;
+
+    if (index >= t->total_size) return 0.0f;  // Sınır kontrolü
+
+    if (t->dtype == DTYPE_FLOAT32) {   // Eğer veri zaten Float ise direkt oku
+        return ((float*)t->data)[index];
+    } 
+    else if (t->dtype == DTYPE_INT8) {     // Eğer veri INT8 ise DE-QUANTIZE et (Formülü uygula)
+        val_i8 = ((int8_t*)t->data)[index];
+        return (val_i8 - t->qparams.zero_point) * t->qparams.scale;
+    }
+    else if (t->dtype == DTYPE_FLOAT16) {  // Float16 simülasyonu
+        val_u16 = ((uint16_t*)t->data)[index];
+        return (float)val_u16; 
+    }
+    return 0.0f;
+}
+
+void tensor_set_from_float(Tensor* t, uint32_t index, float val) {         // Veriyi kaydederken sıkıştırma yapar
+    // Değişken tanımları
+    int32_t q_val;
+
+    if (index >= t->total_size) return;
+
+    if (t->dtype == DTYPE_FLOAT32) {
+        ((float*)t->data)[index] = val;
+    }
+    else if (t->dtype == DTYPE_INT8) {                           
+	  // QUANTIZATION (Sıkıştırma Formülü)
+      // Matematik: Sayıyı ölçeğe böl ve yuvarla.
+        q_val = (int32_t)round(val / t->qparams.scale) + t->qparams.zero_point;
+        // CLAMPING (Kırpma): Sayı 127'den büyükse 127 yap, -128'den küçükse -128 yap.
+        // Çünkü int8_t sınırları budur. Taşmayı önler.
+        
+        if (q_val > 127) q_val = 127;
+        if (q_val < -128) q_val = -128;
+        
+        ((int8_t*)t->data)[index] = (int8_t)q_val;
+    }
+}
+// ==========================================
+// BÖLÜM 4: YAPAY ZEKA MOTORU (AI ENGINE)
+// Amacı: Tensörlerle matematiksel işlem yapmak.
+// ==========================================
+
+// Dense Layer (Tam Bağlı Katman) İleri Besleme
+// İşlem: Input x Weight + Bias
+float dense_layer_forward(Tensor* input, Tensor* weights, Tensor* bias) {
+    float sum = 0.0f;
+    float x, w;
+    int i;
+    
+    // Dot Product (Çarpım Toplamı)
+    for (i = 0; i < input->total_size; i++) {
+        x = tensor_get_as_float(input, i);   
+        w = tensor_get_as_float(weights, i); 
+        sum += x * w;
+    }
+    
+    // Bias Ekleme: Eşik değerini kaydırır.
+    if (bias != NULL) {
+        sum += tensor_get_as_float(bias, 0);
+    }
+    
+    return sum;  // Henüz "karar" verilmemiş ham skor (Logit)
+}
+
+// Sigmoid: Sayıyı 0 ile 1 arasına sıkıştırır (Olasılık üretir)
+// Amacı: Ham skoru (örn: 5.4 veya -3.2) 0 ile 1 arasında bir olasılığa çevirmek.
+float activation_sigmoid(float x) {
+    return 1.0f / (1.0f + (float)exp((double)-x));
+}
+// ==========================================
+// --- AŞAMA 5: UYGULAMA (MAIN) ---
+// Senaryo: Akıllı Termostat
+// ==========================================
+    int main() {
+    // --- DEĞİŞKEN TANIMLAMALARI (EN BAŞTA OLMALI) ---
+    Tensor *inputs, *weights, *bias;
+    
+    // Şekil tanımları: [1 satır, 2 sütun]
+    uint32_t input_shape[] = {1, 2};   // 2 Giriş (Sıcaklık, Nem)
+    uint32_t weight_shape[] = {1, 2};   // 2 Ağırlık (Her giriş için bir katsayı)
+    uint32_t bias_shape[] = {1};       // 1 Bias
+    
+    // --- ÖNEMLİ AYAR: Quantization Scale ---
+    // 0.05f seçtik. Neden?
+    // Ağırlığımız 2.5 idi. 2.5 / 0.05 = 50 yapar. 50 sayısı int8'e (max 127) sığar.
+    // Eğer 0.01 seçseydik, 2.5 / 0.01 = 250 yapardı ve taşma olurdu.
+    QuantParams q_params = {0.05f, 0}; 
+    QuantParams no_q = {0, 0};   // Float için önemsiz
+    
+    float output_logit, final_prediction;
+    
+    printf("--- AI Akilli Termostat (Dev-C++ Uyumlu) ---\n");
+
+    // 1. MODELİ YÜKLE (Ağırlıklar INT8 olarak saklanır, yer kaplamaz)
+    // Senaryo: Sıcaklık (Index 0) çok önemli, Nem (Index 1) az önemli.
+    
+    weights = create_tensor(weight_shape, 2, DTYPE_INT8, q_params);
+    tensor_set_from_float(weights, 0, 2.5f); // Sıcaklık Katsayısı
+    tensor_set_from_float(weights, 1, 0.5f); // Nem Katsayısı
+
+    bias = create_tensor(bias_shape, 1, DTYPE_INT8, q_params);
+    tensor_set_from_float(bias, 0, -1.5f); // Bias (Eşik Değeri)
+
+    // 2. INPUT TENSÖRÜNÜ HAZIRLA (Sensör verisi hassastır, Float kalır)
+    inputs = create_tensor(input_shape, 2, DTYPE_FLOAT32, no_q);
+    
+    // --- TEST SENARYOSU 1 ---
+    // Durum: Hava Soğuk (0.2), Nem Çok Yüksek (0.9)
+    // Beklenti: Klima Açılmamalı.
+    
+    tensor_set_from_float(inputs, 0, 0.2f);
+    tensor_set_from_float(inputs, 1, 0.9f);
+    
+    printf("\n--- Test 1: Sicaklik Dusuk (0.2), Nem Yuksek (0.9) ---\n");
+    
+    // İŞLEM: (0.2 * 2.5) + (0.9 * 0.5) - 1.5 = -0.55
+    output_logit = dense_layer_forward(inputs, weights, bias);
+    // KARAR: Sigmoid(-0.55) = 0.36 (%36 İhtimal)
+    final_prediction = activation_sigmoid(output_logit);
+    
+    printf("Ham Sonuc: %.4f\n", output_logit);
+    printf("Olasilik:  %.4f (%%%.1f)\n", final_prediction, final_prediction * 100);
+    
+    if (final_prediction > 0.5f) printf("KARAR: [X] KLIMA ACIK\n");
+    else                         printf("KARAR: [ ] KLIMA KAPALI\n");
+    
+    // --- TEST SENARYOSU 2 ---
+    // Durum: Hava Çok Sıcak (0.8), Nem Normal (0.5)
+    // Beklenti: Klima Açılmalı.
+    
+    tensor_set_from_float(inputs, 0, 0.8f);
+    tensor_set_from_float(inputs, 1, 0.5f);
+    
+    printf("\n--- Test 2: Sicaklik Yuksek (0.8), Nem Normal (0.5) ---\n");
+    
+    // İŞLEM: (0.8 * 2.5) + (0.5 * 0.5) - 1.5 = 0.75
+    output_logit = dense_layer_forward(inputs, weights, bias);
+    // KARAR: Sigmoid(0.75) = 0.67 (%67 İhtimal)
+    final_prediction = activation_sigmoid(output_logit);
+    
+    printf("Ham Sonuc: %.4f\n", output_logit);
+    printf("Olasilik:  %.4f (%%%.1f)\n", final_prediction, final_prediction * 100);
+    
+    if (final_prediction > 0.5f) printf("KARAR: [X] KLIMA ACIK\n");
+    else                         printf("KARAR: [ ] KLIMA KAPALI\n");
+
+    // Temizlik
+    free_tensor(inputs);
+    free_tensor(weights);
+    free_tensor(bias);
+    
+    return 0;
+}
